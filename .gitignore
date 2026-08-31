@@ -7,6 +7,8 @@ Thumbs.db
 # IDE and editor files
 .idea/
 .vscode/
+.vscode-server/
+.cache/
 *.swp
 *.swo
 
