@@ -9,6 +9,7 @@ Thumbs.db
 .vscode/
 .vscode-server/
 .cache/
+.dotnet/
 *.swp
 *.swo
 
