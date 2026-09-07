@@ -19,9 +19,21 @@
 
 #define PATH_MAX_LEN 256
 #define MAX_FILE_WRITE 3
+#define LINE_LEN 128
+#define SAMPLE_BUF_LEN 64
+
+#define IMU_READY_FLAG 0x0000001
+
+typedef struct
+{
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    uint32_t t_us; // timestamp (lower 32 bits is fine for short runs)
+} Sample;
 
 mutex_t mutex;
 TP_DATA tp_data;
+Sample imu_data[SAMPLE_BUF_LEN];
 
 // --------- Globals (FatFs requires the FS to outlive the mount) ----------
 static FATFS fs;                   // must be static/global (lives as long as the mount)
@@ -108,6 +120,11 @@ static FRESULT create_file(const char *abs_path, FIL *out_file)
 {
     // Creates/truncates a file and opens it for writing
     return f_open(out_file, abs_path, FA_WRITE | FA_CREATE_ALWAYS);
+}
+
+static FRESULT append_file(const char *abs_path, FIL *out_file)
+{
+    return f_open(out_file, abs_path, FA_WRITE | FA_OPEN_APPEND);
 }
 
 // ------------------------- 3) File writing -------------------------------
@@ -201,7 +218,7 @@ static FRESULT check_and_list_files(const char *root_drive)
     char root[PATH_MAX_LEN];
     join_path(root, sizeof root, root_drive, ""); // ensures a trailing slash when we add children
 
-    list_stats_t stats = {0};
+    list_stats_t stats{};
     printf("\n--- SD Card File Listing for '%s' ---\n", root_drive);
     FRESULT fr = list_dir_recursive(root_drive, &stats);
     if (fr != FR_OK && fr != FR_NO_PATH)
@@ -216,11 +233,11 @@ static FRESULT check_and_list_files(const char *root_drive)
     }
     else if (stats.files == 0)
     {
-        printf("No files found (but %u director%s present).\n", stats.dirs, (stats.dirs == 1 ? "y" : "ies"));
+        printf("No files found (but %lu director%s present).\n", stats.dirs, (stats.dirs == 1 ? "y" : "ies"));
     }
     else
     {
-        printf("\nSummary: %u file%s in %u director%s, total %llu bytes.\n",
+        printf("\nSummary: %lu file%s in %lu director%s, total %llu bytes.\n",
                stats.files, (stats.files == 1 ? "" : "s"),
                stats.dirs, (stats.dirs == 1 ? "y" : "ies"),
                (unsigned long long)stats.total_bytes);
@@ -232,7 +249,6 @@ static FRESULT check_and_list_files(const char *root_drive)
 
 void core1_entry()
 {
-
     printf("Core 1 entry: write to SD card\n");
     sleep_ms(2000);
 
@@ -244,12 +260,13 @@ void core1_entry()
 
     int count = 0;
     FRESULT fr;
+    uint32_t t_prev = (uint32_t)time_us_64();
 
     while (count < MAX_FILE_WRITE)
     {
-
         uint32_t msg = multicore_fifo_pop_blocking();
-        if (msg != DATA_READY_FLAG)
+
+        if ((msg != DATA_READY_FLAG) && (msg != IMU_READY_FLAG))
         {
             printf("Core 1 received unexpected message: 0x%08lX\n", msg);
             continue;
@@ -260,69 +277,124 @@ void core1_entry()
         // Build absolute file path: <drive>/lcd_sd_card_example_<iteration>.txt
         char path[PATH_MAX_LEN];
         char name[64];
-        snprintf(name, sizeof(name), "lcd_sd_card_example_%d.txt", count);
+        if (msg == IMU_READY_FLAG)
+        {
+            snprintf(name, sizeof(name), "imu_sd_card_example.txt");
+        }
+        else
+        {
+            snprintf(name, sizeof(name), "lcd_sd_card_example_%d.txt", count);
+        }
         join_path(path, sizeof path, g_drive, name);
 
         printf("Core 1: Creating and writing to file: %s\n", path);
         // 2) Create the file
         FIL f;
-        fr = create_file(path, &f);
-        if (fr != FR_OK)
-            die(fr, "f_open(create)");
+        if (msg == IMU_READY_FLAG)
+        {
+            fr = append_file(path, &f);
+            if (fr != FR_OK)
+                die(fr, "f_open(create)");
+        }
+        else
+        {
+            fr = create_file(path, &f);
+            if (fr != FR_OK)
+                die(fr, "f_open(create)");
+        }
 
         mutex_enter_blocking(&mutex);
 
         // 3) Write data
         UINT bw = 0;
 
-        // Check if data is valid
-        printf("Core 1: tp_data.data_len = %zu\n", tp_data.data_len);
-        printf("Core 1: tp_data.data pointer = %p\n", (void *)tp_data.data);
-
-        if (tp_data.data == NULL || tp_data.data_len == 0)
+        if (msg == IMU_READY_FLAG)
         {
-            printf("ERROR: tp_data.data is NULL or data_len is 0!\n");
-            mutex_exit(&mutex);
-            f_close(&f);
-            continue;
+            size_t max_len = LINE_LEN * SAMPLE_BUF_LEN + 1;
+            char *ascii_buffer = (char *)malloc(max_len);
+            ascii_buffer[0] = '\0';
+
+            char *linebeg_ptr = ascii_buffer;
+            for (uint8_t i = 0; i < SAMPLE_BUF_LEN; ++i)
+            {
+                Sample *s = &imu_data[i];
+                uint32_t t_now = s->t_us;
+
+                uint32_t dt_us = (t_now - t_prev);
+                t_prev = t_now;
+
+                float hz = (dt_us > 0) ? (1000000.0f / (float)dt_us) : 0.0f;
+
+                snprintf(linebeg_ptr, LINE_LEN, "ACC: X=%d Y=%d Z=%d | GYRO: X=%d Y=%d Z=%d | Freq: %.1f Hz\r\n",
+                         s->ax, s->ay, s->az, s->gx, s->gy, s->gz, hz);
+                linebeg_ptr[LINE_LEN] = '\0';
+                linebeg_ptr += strnlen(linebeg_ptr, LINE_LEN);
+            }
+
+            size_t data_len = strnlen(ascii_buffer, max_len);
+            fr = write_to_file(&f, ascii_buffer, data_len, &bw);
+            free(ascii_buffer);
+
+            printf("Core 1: write_to_file returned FR=%d, bytes_written=%u (expected %zu)\n",
+                   fr, bw, data_len);
+            if (fr != FR_OK || bw != data_len)
+            {
+                printf("ERROR: Write failed or incomplete! FR=%d, wrote %u/%zu bytes\n",
+                       fr, bw, data_len);
+                die(fr, "f_write/f_sync");
+            }
         }
-
-        // Print all the data stored in tp_data.data
-        printf("Data contents (%zu bytes): ", tp_data.data_len);
-        for (size_t i = 0; i < tp_data.data_len; i++)
+        else
         {
-            printf("%u ", tp_data.data[i]);
-            if ((i + 1) % BOX_W == 0)
+            // Check if data is valid
+            printf("Core 1: tp_data.data_len = %zu\n", tp_data.data_len);
+            printf("Core 1: tp_data.data pointer = %p\n", (void *)tp_data.data);
+
+            if (tp_data.data == NULL || tp_data.data_len == 0)
+            {
+                printf("ERROR: tp_data.data is NULL or data_len is 0!\n");
+                mutex_exit(&mutex);
+                f_close(&f);
+                continue;
+            }
+
+            // Print all the data stored in tp_data.data
+            printf("Data contents (%zu bytes): ", tp_data.data_len);
+            for (size_t i = 0; i < tp_data.data_len; i++)
+            {
+                printf("%u ", tp_data.data[i]);
+                if ((i + 1) % BOX_W == 0)
+                    printf("\n");
+            }
+            if (tp_data.data_len % 16 != 0)
                 printf("\n");
-        }
-        if (tp_data.data_len % 16 != 0)
-            printf("\n");
 
-        // Convert binary 0/1 to ASCII '0'/'1' for human-readable text file
-        char *ascii_buffer = (char *)malloc(tp_data.data_len);
-        if (ascii_buffer == NULL)
-        {
-            printf("ERROR: Failed to allocate ASCII buffer\n");
-            mutex_exit(&mutex);
-            f_close(&f);
-            die(FR_NOT_ENOUGH_CORE, "malloc");
-        }
+            // Convert binary 0/1 to ASCII '0'/'1' for human-readable text file
+            char *ascii_buffer = (char *)malloc(tp_data.data_len);
+            if (ascii_buffer == NULL)
+            {
+                printf("ERROR: Failed to allocate ASCII buffer\n");
+                mutex_exit(&mutex);
+                f_close(&f);
+                die(FR_NOT_ENOUGH_CORE, "malloc");
+            }
 
-        for (size_t i = 0; i < tp_data.data_len; i++)
-        {
-            ascii_buffer[i] = tp_data.data[i] ? '1' : '0'; // Convert to ASCII '0' or '1'
-        }
+            for (size_t i = 0; i < tp_data.data_len; i++)
+            {
+                ascii_buffer[i] = tp_data.data[i] ? '1' : '0'; // Convert to ASCII '0' or '1'
+            }
 
-        fr = write_to_file(&f, ascii_buffer, (UINT)tp_data.data_len, &bw);
-        free(ascii_buffer);
+            fr = write_to_file(&f, ascii_buffer, (UINT)tp_data.data_len, &bw);
+            free(ascii_buffer);
 
-        printf("Core 1: write_to_file returned FR=%d, bytes_written=%u (expected %zu)\n",
-               fr, bw, tp_data.data_len);
-        if (fr != FR_OK || bw != tp_data.data_len)
-        {
-            printf("ERROR: Write failed or incomplete! FR=%d, wrote %u/%zu bytes\n",
+            printf("Core 1: write_to_file returned FR=%d, bytes_written=%u (expected %zu)\n",
                    fr, bw, tp_data.data_len);
-            die(fr, "f_write/f_sync");
+            if (fr != FR_OK || bw != tp_data.data_len)
+            {
+                printf("ERROR: Write failed or incomplete! FR=%d, wrote %u/%zu bytes\n",
+                       fr, bw, tp_data.data_len);
+                die(fr, "f_write/f_sync");
+            }
         }
 
         // Close the file
@@ -330,7 +402,10 @@ void core1_entry()
 
         mutex_exit(&mutex);
 
-        count++;
+        if (msg == DATA_READY_FLAG)
+        {
+            count++;
+        }
         printf("----- File write iteration %d -----\n", count);
     }
 
@@ -349,11 +424,22 @@ void core1_entry()
     }
 }
 
-int main_final(void)
+int main(void)
 {
-
     System_Init();
     sleep_ms(3000);
+
+    IMU_EN_SENSOR_TYPE type;
+    imuInit(&type);
+
+    if (IMU_EN_SENSOR_TYPE_ICM20948 == type)
+    {
+        printf("Motion sensor is ICM-20948 (multicore)\n");
+    }
+    else
+    {
+        printf("Motion sensor NULL\n");
+    }
 
     mutex_init(&mutex); // Initialize the mutex
 
@@ -364,6 +450,9 @@ int main_final(void)
     TP_Dialog();
 
     multicore_launch_core1(core1_entry);
+
+    Sample sample_buf[SAMPLE_BUF_LEN]{};
+    uint8_t buf_idx = 0;
 
     while (1)
     {
@@ -386,6 +475,26 @@ int main_final(void)
             LCD_SetBackLight(1000);
             TP_DrawBoard();
         }
+
+        IMU_ST_SENSOR_DATA stGyroRawData, stAccelRawData;
+        imuDataAccGyrGet(&stGyroRawData, &stAccelRawData);
+
+        uint32_t t_now = (uint32_t)time_us_64();
+        Sample s = {stAccelRawData.s16X, stAccelRawData.s16Y, stAccelRawData.s16Z,
+                    stGyroRawData.s16X, stGyroRawData.s16Y, stGyroRawData.s16Z,
+                    t_now};
+
+        sample_buf[buf_idx] = s;
+        ++buf_idx;
+        if (buf_idx == SAMPLE_BUF_LEN)
+        {
+            mutex_enter_blocking(&mutex);
+            memcpy(imu_data, sample_buf, sizeof(Sample) * SAMPLE_BUF_LEN);
+            mutex_exit(&mutex);
+
+            multicore_fifo_push_blocking(IMU_READY_FLAG);
+            buf_idx = 0;
+        }
     }
 
     printf("All tasks complete.\n");
@@ -393,89 +502,6 @@ int main_final(void)
     multicore_reset_core1();
 
     printf("Exiting main().\n");
-
-    return 0;
-}
-
-typedef struct
-{
-    int16_t ax, ay, az;
-    int16_t gx, gy, gz;
-    uint32_t t_us; // timestamp (lower 32 bits is fine for short runs)
-} Sample;
-
-static queue_t sample_q;
-
-static void core1_reader(void)
-{
-    IMU_EN_SENSOR_TYPE type;
-
-    // Important: init I2C/IMU on this core as well if your drivers require per-core context.
-    // Usually one init on core0 is fine if both cores share the same hardware state,
-    // but to be safe we at least check sensor here.
-    // If needed, comment out the next line.
-    // imuInit(&type);
-
-    uint32_t t_prev = (uint32_t)time_us_64();
-
-    while (1)
-    {
-        IMU_ST_SENSOR_DATA stGyroRawData, stAccelRawData;
-        // int16_t gx, gy, gz, ax, ay, az;
-        // icm20948AccelFastRead(&ax, &ay, &az);
-        // icm20948GyroFastRead (&gx, &gy, &gz);
-
-        imuDataAccGyrGet(&stGyroRawData, &stAccelRawData);
-
-        uint32_t t_now = (uint32_t)time_us_64();
-        Sample s = {stAccelRawData.s16X, stAccelRawData.s16Y, stAccelRawData.s16Z,
-                    stGyroRawData.s16X, stGyroRawData.s16Y, stGyroRawData.s16Z,
-                    t_now};
-        queue_add_blocking(&sample_q, &s);
-
-        // (Optional) pace the producer slightly if needed
-        // sleep_us(500); // ~2 kHz -> uncomment to throttle
-    }
-}
-
-int main(void)
-{
-    stdio_init_all();
-
-    IMU_EN_SENSOR_TYPE type;
-    imuInit(&type);
-
-    if (IMU_EN_SENSOR_TYPE_ICM20948 == type)
-    {
-        printf("Motion sensor is ICM-20948 (multicore)\n");
-    }
-    else
-    {
-        printf("Motion sensor NULL\n");
-    }
-
-    // Queue can hold up to N samples; adjust for your bandwidth
-    queue_init(&sample_q, sizeof(Sample), 64);
-
-    // Launch core1 reader
-    multicore_launch_core1(core1_reader);
-
-    uint32_t t_prev = (uint32_t)time_us_64();
-
-    while (1)
-    {
-        Sample s;
-        queue_remove_blocking(&sample_q, &s);
-
-        uint32_t t_now = (uint32_t)time_us_64();
-        uint32_t dt_us = (t_now - t_prev);
-        t_prev = t_now;
-        float hz = (dt_us > 0) ? (1000000.0f / (float)dt_us) : 0.0f;
-
-        printf("ACC: X=%d Y=%d Z=%d | GYRO: X=%d Y=%d Z=%d | RX Rate: %.1f Hz\r\n",
-               s.ax, s.ay, s.az, s.gx, s.gy, s.gz, hz);
-        // No sleep: printing rate is now bounded mostly by USB/serial throughput.
-    }
 
     return 0;
 }

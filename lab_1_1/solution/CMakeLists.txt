@@ -72,7 +72,7 @@ set_property(TARGET ${PROGRAM_NAME} APPEND_STRING PROPERTY LINK_FLAGS
 pico_set_program_name(${PROGRAM_NAME} "${PROGRAM_NAME}")
 pico_set_program_version(${PROGRAM_NAME} "0.1")
 
-pico_enable_stdio_uart(${PROGRAM_NAME} 0)
+pico_enable_stdio_uart(${PROGRAM_NAME} 1)
 pico_enable_stdio_usb(${PROGRAM_NAME} 1)
 
 target_include_directories(${PROGRAM_NAME} PUBLIC 
