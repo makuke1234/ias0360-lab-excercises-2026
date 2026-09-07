@@ -82,6 +82,7 @@ target_link_libraries(${PROGRAM_NAME}
     lcd 
     font 
     config 
+    icm20948 
     pico_stdlib
     hardware_i2c
     pico_multicore
