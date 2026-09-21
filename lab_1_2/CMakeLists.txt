@@ -15,7 +15,7 @@ endif()
 cmake_minimum_required(VERSION 3.13)
 
 set(PICO_BOARD pico_w CACHE STRING "Board type")
-set(PROGRAM_NAME statistic)
+set(PROGRAM_NAME fft)
 
 include(pico_sdk_import.cmake)
 
