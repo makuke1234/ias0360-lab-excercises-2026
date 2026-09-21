@@ -19,10 +19,10 @@ include(pico_sdk_import.cmake)
 project(pico-filters)
 pico_sdk_init()
 add_executable(main
-#quantization.c
+quantization.c
 #fft.c
 #sobel.c
-statistic.c
+#statistic.c
 )
 pico_enable_stdio_usb(main 1)
 pico_enable_stdio_uart(main 1)
